@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"trpc.group/trpc-go/trpc-mcp-go/internal/retry"
@@ -711,12 +710,18 @@ func (t *stdioClientTransport) getCommandLine() []string {
 	return result
 }
 
-// isProcessRunning checks if the process is running.
+// isProcessRunning reports whether the spawned server process is still alive.
+// It relies on processWatcher observing the real exit via Wait, so it works on
+// every platform; a signal-based liveness probe (signal 0) is Unix-only —
+// Windows rejects every signal except Kill/Interrupt.
 func (t *stdioClientTransport) isProcessRunning() bool {
 	if t.process == nil || t.process.Process == nil {
 		return false
 	}
-
-	// On Unix systems, sending signal 0 checks if process exists.
-	return t.process.Process.Signal(syscall.Signal(0)) == nil
+	select {
+	case <-t.done:
+		return false
+	default:
+		return true
+	}
 }
