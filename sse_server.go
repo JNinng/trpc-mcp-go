@@ -527,14 +527,28 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	stream.SendComment("connection established")
 
 	// Start notification handler.
-	go handleNotifications(ctx, s.logger, w, flusher, session)
+	var writers sync.WaitGroup
+
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		handleNotifications(ctx, s.logger, w, flusher, session)
+	}()
 
 	// Start event queue handler.
-	go handleEventQueue(ctx, s.logger, w, flusher, session)
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		handleEventQueue(ctx, s.logger, w, flusher, session)
+	}()
 
 	// Start keep-alive handler.
 	if s.keepAlive {
-		go handleKeepAlive(ctx, s.logger, w, flusher, session, s.keepAliveInterval)
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			handleKeepAlive(ctx, s.logger, w, flusher, session, s.keepAliveInterval)
+		}()
 	}
 
 	// Wait for connection to close.
@@ -547,9 +561,12 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.logger.Debugf("Session %s closed", sessionID)
 	}
 
-	// Clean up resources.
+	// Clean up resources. Closing done releases the writer goroutines; they
+	// share the response writer with net/http's request finalization, which
+	// starts as soon as this handler returns, so wait for them to stop first.
 	closeSessionDone(s.logger, session)
 	s.sessions.Delete(sessionID)
+	writers.Wait()
 	s.logger.Debugf("Cleaned up session %s", sessionID)
 }
 
