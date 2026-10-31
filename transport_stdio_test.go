@@ -51,12 +51,7 @@ func TestStdioTransportIsProcessRunningTracksProcessExit(t *testing.T) {
 	// exit the transport must report not running.
 	require.NoError(t, transport.stdin.Close())
 	require.Eventually(t, func() bool {
-		select {
-		case <-transport.done:
-			return true
-		default:
-			return false
-		}
+		return !transport.isProcessRunning()
 	}, 5*time.Second, 10*time.Millisecond)
 	require.False(t, transport.isProcessRunning())
 }
