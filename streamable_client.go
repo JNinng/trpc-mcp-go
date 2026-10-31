@@ -40,17 +40,30 @@ type streamableHTTPClientTransport struct {
 	// Custom HTTP headers to be added to all requests
 	httpHeaders http.Header
 
+	// sessionStateMutex guards the session state below.
+	// The GET SSE goroutine reads the session ID while connecting and updates
+	// the last event ID while streaming events, concurrently with the
+	// goroutines that build requests and handle POST responses.
+	sessionStateMutex sync.RWMutex
+
 	// Session ID
 	sessionID string
-
-	// Notification handlers
-	notificationHandlers map[string]NotificationHandler
 
 	// Last event ID (for connection recovery)
 	lastEventID string
 
+	// Whether in stateless mode
+	// In stateless mode, the client will not send a session ID and will not attempt to establish a GET SSE connection.
+	// This field is set by auto-detection when no session ID is provided in the initialize response.
+	isStateless bool
+
 	// Whether GET SSE is enabled
+	// Written by transport options at construction and by the stateless
+	// auto-detection in send; read when establishing GET SSE connections.
 	enableGetSSE bool
+
+	// Notification handlers
+	notificationHandlers map[string]NotificationHandler
 
 	// Retry configuration
 	retryConfig *retry.Config
@@ -65,11 +78,6 @@ type streamableHTTPClientTransport struct {
 
 	// Notification handlers mutex
 	handlersMutex sync.RWMutex
-
-	// Whether in stateless mode
-	// In stateless mode, the client will not send a session ID and will not attempt to establish a GET SSE connection.
-	// This field is set by auto-detection when no session ID is provided in the initialize response.
-	isStateless bool
 
 	// Logger for this client transport.
 	logger Logger
@@ -254,15 +262,19 @@ func (t *streamableHTTPClientTransport) send(
 	// Set request headers - accept both SSE and JSON responses
 	httpReq.Header.Set(httputil.ContentTypeHeader, httputil.ContentTypeJSON)
 	httpReq.Header.Set(httputil.AcceptHeader, httputil.ContentTypeJSON+", "+httputil.ContentTypeSSE)
-	if t.sessionID != "" && !t.isStateless {
-		httpReq.Header.Set(httputil.SessionIDHeader, t.sessionID)
+	t.sessionStateMutex.RLock()
+	sessionID := t.sessionID
+	stateless := t.isStateless
+	t.sessionStateMutex.RUnlock()
+	if sessionID != "" && !stateless {
+		httpReq.Header.Set(httputil.SessionIDHeader, sessionID)
 	}
 
 	// If lastEventID is provided, attach it to the request
 	if options != nil && options.lastEventID != "" {
 		httpReq.Header.Set(httputil.LastEventIDHeader, options.lastEventID)
-	} else if t.lastEventID != "" {
-		httpReq.Header.Set(httputil.LastEventIDHeader, t.lastEventID)
+	} else if lastEventID := t.getLastEventID(); lastEventID != "" {
+		httpReq.Header.Set(httputil.LastEventIDHeader, lastEventID)
 	}
 
 	// Add custom headers
@@ -286,14 +298,16 @@ func (t *streamableHTTPClientTransport) send(
 	}
 
 	// Handle session ID
+	t.sessionStateMutex.Lock()
 	if sessionID := httpResp.Header.Get(httputil.SessionIDHeader); sessionID != "" {
-		t.setSessionID(sessionID)
+		t.sessionID = sessionID
 		t.isStateless = false
 	} else if req.Method == MethodInitialize && !t.isStateless {
 		// If this is an initialize request and no session ID was received, auto-detect as stateless mode
 		t.isStateless = true
 		t.enableGetSSE = false // Disable GET SSE in stateless mode
 	}
+	t.sessionStateMutex.Unlock()
 
 	// Check content type
 	contentType := httpResp.Header.Get(httputil.ContentTypeHeader)
@@ -464,7 +478,7 @@ func (t *streamableHTTPClientTransport) handleSSEResponse(
 
 			// Process event ID
 			if strings.HasPrefix(line, "id:") {
-				t.lastEventID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
+				t.setLastEventID(strings.TrimSpace(strings.TrimPrefix(line, "id:")))
 				continue
 			}
 
@@ -523,8 +537,8 @@ func (t *streamableHTTPClientTransport) sendNotification(ctx context.Context, no
 	// Set request headers - must accept both JSON and SSE responses per MCP specification.
 	httpReq.Header.Set(httputil.ContentTypeHeader, httputil.ContentTypeJSON)
 	httpReq.Header.Set(httputil.AcceptHeader, httputil.ContentTypeJSON+", "+httputil.ContentTypeSSE)
-	if t.sessionID != "" {
-		httpReq.Header.Set(httputil.SessionIDHeader, t.sessionID)
+	if sessionID := t.getSessionID(); sessionID != "" {
+		httpReq.Header.Set(httputil.SessionIDHeader, sessionID)
 	}
 
 	// Add custom headers
@@ -556,7 +570,7 @@ func (t *streamableHTTPClientTransport) sendNotification(ctx context.Context, no
 
 	// Handle session ID
 	if sessionID := httpResp.Header.Get(httputil.SessionIDHeader); sessionID != "" {
-		t.sessionID = sessionID
+		t.setSessionID(sessionID)
 	}
 
 	// Check status code
@@ -599,12 +613,30 @@ func (t *streamableHTTPClientTransport) close() error {
 
 // GetSessionID gets the session ID
 func (t *streamableHTTPClientTransport) getSessionID() string {
+	t.sessionStateMutex.RLock()
+	defer t.sessionStateMutex.RUnlock()
 	return t.sessionID
 }
 
 // SetSessionID sets the session ID
 func (t *streamableHTTPClientTransport) setSessionID(sessionID string) {
+	t.sessionStateMutex.Lock()
+	defer t.sessionStateMutex.Unlock()
 	t.sessionID = sessionID
+}
+
+// getLastEventID gets the last received SSE event ID
+func (t *streamableHTTPClientTransport) getLastEventID() string {
+	t.sessionStateMutex.RLock()
+	defer t.sessionStateMutex.RUnlock()
+	return t.lastEventID
+}
+
+// setLastEventID sets the last received SSE event ID
+func (t *streamableHTTPClientTransport) setLastEventID(lastEventID string) {
+	t.sessionStateMutex.Lock()
+	defer t.sessionStateMutex.Unlock()
+	t.lastEventID = lastEventID
 }
 
 // Establish GET SSE connection
@@ -644,8 +676,14 @@ func (t *streamableHTTPClientTransport) establishGetSSE(parentCtx context.Contex
 
 // Connect to GET SSE endpoint
 func (t *streamableHTTPClientTransport) connectGetSSE(ctx context.Context) error {
+	// Snapshot the session state before building the request.
+	t.sessionStateMutex.RLock()
+	sessionID := t.sessionID
+	lastEventID := t.lastEventID
+	t.sessionStateMutex.RUnlock()
+
 	// Check if there's a session ID
-	if t.sessionID == "" {
+	if sessionID == "" {
 		return fmt.Errorf("cannot establish GET SSE connection: session ID is empty")
 	}
 
@@ -660,9 +698,9 @@ func (t *streamableHTTPClientTransport) connectGetSSE(ctx context.Context) error
 
 	// Set necessary headers
 	req.Header.Set(httputil.AcceptHeader, httputil.ContentTypeSSE)
-	req.Header.Set(httputil.SessionIDHeader, t.sessionID)
-	if t.lastEventID != "" {
-		req.Header.Set(httputil.LastEventIDHeader, t.lastEventID)
+	req.Header.Set(httputil.SessionIDHeader, sessionID)
+	if lastEventID != "" {
+		req.Header.Set(httputil.LastEventIDHeader, lastEventID)
 	}
 
 	// Add custom headers
@@ -679,7 +717,7 @@ func (t *streamableHTTPClientTransport) connectGetSSE(ctx context.Context) error
 		}
 	}
 
-	t.logger.Debugf("Attempting to establish GET SSE connection, session ID: %s", t.sessionID)
+	t.logger.Debugf("Attempting to establish GET SSE connection, session ID: %s", sessionID)
 
 	// Send request
 	resp, err := t.httpReqHandler.Handle(ctx, t.httpClient, req)
@@ -699,7 +737,7 @@ func (t *streamableHTTPClientTransport) connectGetSSE(ctx context.Context) error
 	}
 
 	// Handle response
-	t.logger.Debugf("GET SSE connection established, session ID: %s", t.sessionID)
+	t.logger.Debugf("GET SSE connection established, session ID: %s", sessionID)
 
 	// Handle SSE event stream
 	return t.handleGetSSEEvents(ctx, resp.Body)
@@ -732,7 +770,7 @@ func (t *streamableHTTPClientTransport) handleGetSSEEvents(ctx context.Context, 
 			if strings.HasPrefix(line, "id:") {
 				eventID = strings.TrimPrefix(line, "id:")
 				eventID = strings.TrimSpace(eventID)
-				t.lastEventID = eventID
+				t.setLastEventID(eventID)
 			} else if strings.HasPrefix(line, "data:") {
 				data := strings.TrimPrefix(line, "data:")
 				data = strings.TrimSpace(data)
@@ -751,7 +789,7 @@ func (t *streamableHTTPClientTransport) handleGetSSEEvents(ctx context.Context, 
 // Process SSE event.
 func (t *streamableHTTPClientTransport) processSSEEvent(eventID, eventData string) {
 	// Store the last event ID for connection recovery.
-	t.lastEventID = eventID
+	t.setLastEventID(eventID)
 
 	// Skip empty events.
 	if eventData == "" {
@@ -890,8 +928,8 @@ func (t *streamableHTTPClientTransport) sendResponseToServer(response interface{
 	}
 
 	// Add session ID if available
-	if t.sessionID != "" {
-		httpReq.Header.Set(httputil.SessionIDHeader, t.sessionID) // Use correct MCP protocol header: Mcp-Session-Id.
+	if sessionID := t.getSessionID(); sessionID != "" {
+		httpReq.Header.Set(httputil.SessionIDHeader, sessionID) // Use correct MCP protocol header: Mcp-Session-Id.
 	}
 
 	var resp *http.Response
@@ -926,8 +964,9 @@ func (t *streamableHTTPClientTransport) terminateSession(ctx context.Context) er
 	}
 
 	// Set session ID header
-	if t.sessionID != "" {
-		httpReq.Header.Set(httputil.SessionIDHeader, t.sessionID)
+	sessionID := t.getSessionID()
+	if sessionID != "" {
+		httpReq.Header.Set(httputil.SessionIDHeader, sessionID)
 	} else {
 		return fmt.Errorf("no active session")
 	}
@@ -954,7 +993,7 @@ func (t *streamableHTTPClientTransport) terminateSession(ctx context.Context) er
 	}
 
 	// Session successfully terminated, clear session ID
-	t.sessionID = ""
+	t.setSessionID("")
 
 	return nil
 }
@@ -968,6 +1007,8 @@ func (t *streamableHTTPClientTransport) terminateSession(ctx context.Context) er
 // If it returns true, the client is currently running in stateless mode and will not include
 // a session ID in requests or attempt to establish GET SSE connections.
 func (t *streamableHTTPClientTransport) isStatelessMode() bool {
+	t.sessionStateMutex.RLock()
+	defer t.sessionStateMutex.RUnlock()
 	return t.isStateless
 }
 
@@ -982,12 +1023,15 @@ func (t *streamableHTTPClientTransport) sendRequestWithStream(
 
 // establishGetSSEConnection attempts to establish a GET SSE connection if enabled
 func (t *streamableHTTPClientTransport) establishGetSSEConnection(ctx context.Context) {
-	if !t.enableGetSSE {
+	t.sessionStateMutex.RLock()
+	enableGetSSE := t.enableGetSSE
+	t.sessionStateMutex.RUnlock()
+	if !enableGetSSE {
 		t.logger.Debug("GET SSE is not enabled, will not establish GET SSE connection")
 		return
 	}
 
-	if t.sessionID == "" {
+	if t.getSessionID() == "" {
 		t.logger.Debug("Session ID is empty, cannot establish GET SSE connection")
 		return
 	}

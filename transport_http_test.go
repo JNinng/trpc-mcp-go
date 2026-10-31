@@ -126,7 +126,7 @@ func TestNewClientTransport(t *testing.T) {
 	assert.NotNil(t, transport)
 
 	// Verify basic properties
-	assert.Equal(t, "", transport.sessionID) // Initial session ID should be empty
+	assert.Equal(t, "", transport.getSessionID()) // Initial session ID should be empty
 }
 
 // Test HTTP headers transport option
